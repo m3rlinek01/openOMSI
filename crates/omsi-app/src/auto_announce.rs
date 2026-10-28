@@ -6,8 +6,9 @@
 //! with its volume, its 3D sound and its terminus suffix.
 //!
 //! What the scripts do is left alone: a press is skipped where the counter already stands
-//! where it should, an arrival is pressed for again until it is heard (electrics off, another
-//! IBIS mode, a script that was busy), and a departure the scripts did not step on by
+//! where it should, a start or arrival press made with the electrics off is tried again until
+//! they are on (one made with them on counts as played, whether the counter moved or not),
+//! and a departure the scripts did not step on by
 //! themselves is made up for once after a grace period. That last is the watchdog for the
 //! maps whose depot files the scripts cannot follow, and it is armed only where there is a
 //! second recording to miss.
@@ -49,10 +50,13 @@ struct Want {
     /// The bus has to still stand at its stop: an arrival recording is dropped when it drives
     /// on, since a stop the bus passes is not announced.
     at_stop: bool,
-    /// A press that plays and leaves the counter where it stood is tried again. Not so for the
-    /// line's start recording: some scripts play it without stepping the counter on, and it
-    /// came again every second for as long as the bus stood at its first stop (#3282).
-    retry: bool,
+    /// The line's start recording (see [`AutoAnnounce::park`]): once played, its route is noted.
+    start: bool,
+    /// A press made with the electrics on counts as played, whether the counter moved or not:
+    /// some scripts play without stepping it on (the O560 of #3282), and were pressed again
+    /// every second for as long as the bus stood there. With the electrics off it is tried
+    /// again, as before.
+    powered_plays: bool,
 }
 
 /// The announcements of one bus, a frame at a time.
@@ -66,8 +70,9 @@ pub(crate) struct AutoAnnounce {
     at_stop: Option<bool>,
     /// The stop of the trip whose arrival recording was pressed for last.
     announced: Option<usize>,
-    /// The trip's start recording was asked for: once a trip, as the driver presses it once.
-    parked: bool,
+    /// The route whose start recording was played at the trip's first stop: once a route, as
+    /// the driver presses it once (another route typed in at the stop gets its own).
+    parked: Option<usize>,
     /// The press still to come (one at a time: the IBIS is a counter, and only one step can
     /// be taken at a time).
     want: Option<Want>,
@@ -104,7 +109,7 @@ impl AutoAnnounce {
             self.trip = Some(d.trip_index);
             self.at_stop = Some(d.at_stop());
             self.announced = None;
-            self.parked = false;
+            self.parked = None;
             self.want = None;
             self.watch = None;
         }
@@ -152,17 +157,21 @@ impl AutoAnnounce {
     /// plays the first stop's recording, so a start recording the scripts never played is
     /// heard here rather than at the departure, where it would be cut off.
     fn park(&mut self, bus: &impl Ibis, next_stop: usize, layout: Option<TwoRecordings>, now: f64) {
+        if next_stop != 0 {
+            // (a duty sent back to its first stop plays it again)
+            self.parked = None;
+            return;
+        }
         let Some(layout) = layout.filter(|l| l.pairs > 0) else { return };
-        if next_stop != 0 || self.parked {
+        let route = route(bus);
+        if route.is_some() && self.parked == route {
             return;
         }
         let Some(entry) = park_target(layout, bus.var("IBIS_busstop")) else { return };
-        // (one silent step a frame, so that a script's own press in between is seen; asked
-        // for once - armed again whenever the last one ran out, a script that plays the start
-        // recording but keeps its counter heard it every second)
+        // (one silent step a frame, so that a script's own press in between is seen; once a
+        // route, see `press_step`)
         if self.want.is_none() {
-            self.want = Some(Want { entry, until: now + ARRIVAL_WAIT, at_stop: true, retry: false });
-            self.parked = true;
+            self.want = Some(Want { entry, until: now + ARRIVAL_WAIT, at_stop: true, start: true, powered_plays: true });
         }
     }
 
@@ -191,7 +200,7 @@ impl AutoAnnounce {
             return;
         };
         self.announced = Some(d.next_stop);
-        self.want = Some(Want { entry, until: now + ARRIVAL_WAIT, at_stop: true, retry: true });
+        self.want = Some(Want { entry, until: now + ARRIVAL_WAIT, at_stop: true, start: false, powered_plays: true });
         log::info!("auto-announce: arrival at '{}', entry {entry} of route {route}", stop.name.trim());
     }
 
@@ -244,9 +253,13 @@ impl AutoAnnounce {
         }
         if target - at < 1.5 {
             // (the press itself steps on by one, and plays)
+            let on = powered(bus);
             self.press(bus, "IBIS_vor", now);
-            if !want.retry {
+            if want.powered_plays && on {
                 // (played, whether the counter moved or not: not again)
+                if want.start {
+                    self.parked = route(bus);
+                }
                 self.want = None;
                 return;
             }
@@ -279,7 +292,7 @@ impl AutoAnnounce {
         if self.want.is_some() {
             return;
         }
-        self.want = Some(Want { entry: entry as usize + 1, until: now + SCRIPT_GRACE, at_stop: false, retry: true });
+        self.want = Some(Want { entry: entry as usize + 1, until: now + SCRIPT_GRACE, at_stop: false, start: false, powered_plays: false });
         log::warn!("auto-announce: the scripts left the IBIS at entry {entry}, pressed it on");
     }
 
@@ -331,8 +344,13 @@ fn park_target(layout: TwoRecordings, at: Option<f32>) -> Option<usize> {
     (entry as f32 - at > 0.5).then_some(entry)
 }
 
+/// Whether the bus's electrics are on (`elec_busbar_main`; a bus without it counts as on).
+fn powered(bus: &impl Ibis) -> bool {
+    bus.var("elec_busbar_main").is_none_or(|v| v >= 0.5)
+}
+
 /// The route whose stop list the IBIS shows: its `IBIS_RouteIndex`, or the ibox's own.
-fn route(bus: &VehicleInstance) -> Option<usize> {
+fn route(bus: &impl Ibis) -> Option<usize> {
     bus.var("IBIS_RouteIndex")
         .or_else(|| bus.var("ibox_routenindex"))
         .filter(|r| *r >= 0.0)
@@ -359,29 +377,47 @@ mod tests {
         assert_eq!(park_target(beijing, None), None);
     }
 
-    /// An IBIS whose `IBIS_vor` plays (counted) and steps the counter on, or not.
+    /// An IBIS whose `IBIS_vor` plays (counted) and steps the counter on, or not, with the
+    /// electrics on; with them off a press does nothing.
     struct FakeIbis {
         busstop: f32,
         steps: bool,
         plays: usize,
+        power: bool,
+        route: f32,
+    }
+
+    impl FakeIbis {
+        fn new(steps: bool) -> Self {
+            FakeIbis { busstop: 0.0, steps, plays: 0, power: true, route: 57.0 }
+        }
     }
 
     impl Ibis for FakeIbis {
         fn var(&self, name: &str) -> Option<f32> {
-            (name == "IBIS_busstop").then_some(self.busstop)
+            match name {
+                "IBIS_busstop" => Some(self.busstop),
+                "IBIS_RouteIndex" => Some(self.route),
+                "elec_busbar_main" => Some(if self.power { 1.0 } else { 0.0 }),
+                _ => None,
+            }
         }
 
         fn trigger(&mut self, name: &str) -> bool {
             match name {
                 "IBIS_vor" => {
-                    self.plays += 1;
-                    if self.steps {
-                        self.busstop += 1.0;
+                    if self.power {
+                        self.plays += 1;
+                        if self.steps {
+                            self.busstop += 1.0;
+                        }
                     }
                     true
                 }
                 "IBIS_vor_stumm" => {
-                    self.busstop += 1.0;
+                    if self.power {
+                        self.busstop += 1.0;
+                    }
                     true
                 }
                 _ => name.ends_with("_off"),
@@ -389,14 +425,16 @@ mod tests {
         }
     }
 
-    /// A minute at the first stop at 60 frames a second, as `step` runs it there.
-    fn stand_at_first_stop(bus: &mut FakeIbis) {
-        let mut a = AutoAnnounce::new();
+    const LAYOUT: Option<TwoRecordings> = Some(TwoRecordings { first: 2, pairs: 18 });
+
+    /// `secs` at a stop at 60 frames a second, as `step` runs it there, from `t0`; `bus`
+    /// may be changed at each frame.
+    fn stand(a: &mut AutoAnnounce, bus: &mut FakeIbis, next_stop: usize, t0: f64, secs: f64, at: &mut dyn FnMut(f64, &mut FakeIbis)) {
         a.at_stop = Some(true);
-        let layout = Some(TwoRecordings { first: 2, pairs: 18 });
-        for f in 0..3600 {
-            let now = f as f64 / 60.0;
-            a.park(bus, 0, layout, now);
+        for f in 0..(secs * 60.0) as usize {
+            let now = t0 + f as f64 / 60.0;
+            at(now, bus);
+            a.park(bus, next_stop, LAYOUT, now);
             a.press_step(bus, now);
         }
     }
@@ -405,25 +443,61 @@ mod tests {
     fn the_start_recording_plays_once_even_where_the_counter_stays() {
         // (the O560 of #3282: its script plays `welcome…` and leaves the counter at 0 - it
         // was pressed again every second, 63 times in a minute)
-        let mut keeps = FakeIbis { busstop: 0.0, steps: false, plays: 0 };
-        stand_at_first_stop(&mut keeps);
+        let mut keeps = FakeIbis::new(false);
+        stand(&mut AutoAnnounce::new(), &mut keeps, 0, 0.0, 60.0, &mut |_, _| {});
         assert_eq!(keeps.plays, 1);
         // (a stock script steps on to the start recording's entry: once, and parked there)
-        let mut steps = FakeIbis { busstop: 0.0, steps: true, plays: 0 };
-        stand_at_first_stop(&mut steps);
+        let mut steps = FakeIbis::new(true);
+        stand(&mut AutoAnnounce::new(), &mut steps, 0, 0.0, 60.0, &mut |_, _| {});
         assert_eq!((steps.plays, steps.busstop), (1, 1.0));
     }
 
     #[test]
-    fn an_arrival_the_script_did_not_take_is_tried_again() {
-        // (electrics off: the press does nothing, and is tried again a second later)
-        let mut bus = FakeIbis { busstop: 4.0, steps: false, plays: 0 };
+    fn the_start_recording_waits_for_the_electrics() {
+        // (the driver switches on 30 s after the duty starts: the start recording is played
+        // then, once - not lost because the first presses went unheard)
+        let mut bus = FakeIbis::new(false);
+        bus.power = false;
+        stand(&mut AutoAnnounce::new(), &mut bus, 0, 0.0, 60.0, &mut |now, b| b.power = now >= 30.0);
+        assert_eq!(bus.plays, 1);
+    }
+
+    #[test]
+    fn another_route_or_the_first_stop_again_plays_the_start_recording_again() {
+        let mut a = AutoAnnounce::new();
+        let mut bus = FakeIbis::new(false);
+        stand(&mut a, &mut bus, 0, 0.0, 10.0, &mut |_, _| {});
+        // (another route typed into the IBIS at the first stop)
+        stand(&mut a, &mut bus, 0, 10.0, 10.0, &mut |_, b| b.route = 58.0);
+        assert_eq!(bus.plays, 2);
+        // (the duty sent on and back to its first stop on the same trip)
+        stand(&mut a, &mut bus, 1, 20.0, 1.0, &mut |_, _| {});
+        stand(&mut a, &mut bus, 0, 21.0, 10.0, &mut |_, _| {});
+        assert_eq!(bus.plays, 3);
+    }
+
+    /// An arrival press at entry 5 with the IBIS at 4, for `secs`.
+    fn arrival(bus: &mut FakeIbis, secs: f64, power_at: f64) {
         let mut a = AutoAnnounce::new();
         a.at_stop = Some(true);
-        a.want = Some(Want { entry: 5, until: ARRIVAL_WAIT, at_stop: true, retry: true });
-        for f in 0..300 {
-            a.press_step(&mut bus, f as f64 / 60.0);
+        a.want = Some(Want { entry: 5, until: ARRIVAL_WAIT, at_stop: true, start: false, powered_plays: true });
+        bus.busstop = 4.0;
+        for f in 0..(secs * 60.0) as usize {
+            let now = f as f64 / 60.0;
+            bus.power = now >= power_at;
+            a.press_step(bus, now);
         }
-        assert_eq!(bus.plays, 5);
+    }
+
+    #[test]
+    fn an_arrival_is_played_once_and_waits_for_the_electrics() {
+        // (a script that plays without stepping on: once, not every second for 20 s)
+        let mut keeps = FakeIbis::new(false);
+        arrival(&mut keeps, 10.0, 0.0);
+        assert_eq!(keeps.plays, 1);
+        // (electrics off for the first 3 s: tried again until they are on, then played once)
+        let mut late = FakeIbis::new(true);
+        arrival(&mut late, 10.0, 3.0);
+        assert_eq!((late.plays, late.busstop), (1, 5.0));
     }
 }
