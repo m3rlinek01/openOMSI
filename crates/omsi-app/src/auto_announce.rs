@@ -270,6 +270,10 @@ impl AutoAnnounce {
         } else if self.no_skip {
             // (no `IBIS_vor_stumm`: pressing on would play the entries in between)
             log::info!("auto-announce: the IBIS cannot be stepped on silently, entry {target} left alone");
+            if want.start {
+                // (given up for this route, not asked for again every frame)
+                self.parked = route(bus);
+            }
             self.want = None;
         } else {
             self.press(bus, "IBIS_vor_stumm", now);
@@ -400,13 +404,14 @@ mod tests {
         power: bool,
         deaf: bool,
         late: bool,
+        silent_key: bool,
         pending: usize,
         route: f32,
     }
 
     impl FakeIbis {
         fn new(steps: bool) -> Self {
-            FakeIbis { busstop: 0.0, steps, plays: 0, power: true, deaf: false, late: false, pending: 0, route: 57.0 }
+            FakeIbis { busstop: 0.0, steps, plays: 0, power: true, deaf: false, late: false, silent_key: true, pending: 0, route: 57.0 }
         }
 
         /// A frame of the scripts: what a `late` IBIS was pressed for plays now.
@@ -440,7 +445,7 @@ mod tests {
                     }
                     true
                 }
-                "IBIS_vor_stumm" => {
+                "IBIS_vor_stumm" if self.silent_key => {
                     if self.power {
                         self.busstop += 1.0;
                     }
@@ -545,6 +550,23 @@ mod tests {
         let mut keeps = FakeIbis::new(false);
         arrival(&mut keeps, 10.0, 0.0, 3.0);
         assert_eq!(keeps.plays, 1);
+    }
+
+    #[test]
+    fn a_start_recording_out_of_reach_is_given_up_once() {
+        // (no `IBIS_vor_stumm` and the start recording three entries on, the KPP2 IBIS of the
+        // Urbino III: left alone, and not asked for again every frame)
+        let mut a = AutoAnnounce::new();
+        let mut bus = FakeIbis::new(false);
+        bus.silent_key = false;
+        a.at_stop = Some(true);
+        let far = Some(TwoRecordings { first: 4, pairs: 3 });
+        for f in 0..600 {
+            let now = f as f64 / 60.0;
+            a.park(&bus, 0, far, now);
+            a.press_step(&mut bus, now);
+        }
+        assert_eq!((bus.plays, bus.busstop, a.parked, a.want.is_none()), (0, 0.0, Some(57), true));
     }
 
     #[test]
